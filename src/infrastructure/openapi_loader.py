@@ -2,6 +2,7 @@
 OpenAPI specification loader service.
 """
 
+import copy
 import tempfile
 import time
 from pathlib import Path
@@ -32,9 +33,105 @@ class OpenApiSpecLoader:
         """
         cached_spec = self._load_from_cache()
         if cached_spec is not None:
-            return cached_spec
+            return self._optimize_spec(cached_spec)
 
-        return self._download_and_cache_spec()
+        return self._optimize_spec(self._download_and_cache_spec())
+
+    @staticmethod
+    def _truncate_description(text: str, max_len: int = 200) -> str:
+        """Truncate description, keeping first sentence or max_len chars."""
+        if not text or len(text) <= max_len:
+            return text
+        # Keep first sentence if it fits
+        for sep in (". ", ".\n"):
+            idx = text.find(sep)
+            if 0 < idx <= max_len:
+                return text[: idx + 1]
+        return text[:max_len].rsplit(" ", 1)[0] + "..."
+
+    @classmethod
+    def _optimize_spec(cls, spec: dict[str, Any]) -> dict[str, Any]:
+        """Aggressively strip non-input data to reduce token usage."""
+        spec = copy.deepcopy(spec)
+
+        for path_data in spec.get("paths", {}).values():
+            for method_key, method_data in path_data.items():
+                if not isinstance(method_data, dict):
+                    continue
+
+                # 1. Strip all responses — only keep minimal 200
+                method_data["responses"] = {"200": {"description": "OK"}}
+
+                # 2. Truncate operation description
+                if "description" in method_data:
+                    method_data["description"] = cls._truncate_description(
+                        method_data["description"], 300
+                    )
+
+                # 3. Trim parameters: truncate descriptions, remove examples
+                for param in method_data.get("parameters", []):
+                    if not isinstance(param, dict):
+                        continue
+                    param.pop("examples", None)
+                    param.pop("example", None)
+                    if "description" in param:
+                        param["description"] = cls._truncate_description(
+                            param["description"], 120
+                        )
+
+                # 4. Trim request body: truncate descriptions, remove examples
+                req_body = method_data.get("requestBody")
+                if isinstance(req_body, dict):
+                    for content in req_body.get("content", {}).values():
+                        if isinstance(content, dict):
+                            content.pop("examples", None)
+                            content.pop("example", None)
+                            # Trim descriptions inside schema properties
+                            schema = content.get("schema", {})
+                            cls._trim_schema_descriptions(schema)
+
+        # 5. Remove component examples entirely
+        components = spec.get("components", {})
+        components.pop("examples", None)
+
+        # 6. Remove response-only schemas from components
+        schemas = components.get("schemas", {})
+        to_remove = [
+            name for name in schemas
+            if any(
+                kw in name.lower()
+                for kw in (
+                    "response", "_200_", "_400_", "_401_", "_403_",
+                    "_404_", "_422_", "_429_", "_500_",
+                )
+            )
+        ]
+        for name in to_remove:
+            del schemas[name]
+
+        # 7. Trim descriptions inside remaining component schemas
+        for schema in schemas.values():
+            if isinstance(schema, dict):
+                cls._trim_schema_descriptions(schema)
+
+        return spec
+
+    @classmethod
+    def _trim_schema_descriptions(cls, schema: dict[str, Any]) -> None:
+        """Recursively truncate descriptions within a JSON schema."""
+        if not isinstance(schema, dict):
+            return
+        if "description" in schema:
+            schema["description"] = cls._truncate_description(schema["description"], 120)
+        schema.pop("example", None)
+        schema.pop("examples", None)
+        for prop in schema.get("properties", {}).values():
+            cls._trim_schema_descriptions(prop)
+        for kw in ("items", "additionalProperties"):
+            if isinstance(schema.get(kw), dict):
+                cls._trim_schema_descriptions(schema[kw])
+        for item in schema.get("allOf", []) + schema.get("oneOf", []) + schema.get("anyOf", []):
+            cls._trim_schema_descriptions(item)
 
     def _load_from_cache(self) -> dict[str, Any] | None:
         """Load spec from cache if it exists and is recent."""

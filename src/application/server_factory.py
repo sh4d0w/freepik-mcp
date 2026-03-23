@@ -89,8 +89,16 @@ class ServerFactory:
             mcp_component_fn=mcp_component_fn,
         )
 
-        # Explicitly add the transformed tool
+        # Explicitly add the transformed tool and remove the disabled original
         for tool in transformed_tools:
             server.add_tool(tool)
+
+        # Remove disabled tools (e.g. original mystic replaced by polling version)
+        disabled = [
+            name for name, t in server._tool_manager._tools.items()
+            if hasattr(t, "enabled") and not t.enabled
+        ]
+        for name in disabled:
+            del server._tool_manager._tools[name]
 
         return server
